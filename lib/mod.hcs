@@ -1,1 +1,445 @@
+get <crates:tauri::2>
+get <crates:serde_json::1.0>
 
+
+!! ---------------------------------------------------------------
+!! Uruchomienie aplikacji
+!! ---------------------------------------------------------------
+
+!!! Buduje i uruchamia aplikacje Tauri z tauri/tauri.conf.json. Blokuje do
+!!! zamkniecia ostatniego okna. Zwraca "" po poprawnym zakonczeniu albo
+!!! opis bledu budowy aplikacji.
+fun tauri_run() -> Str [
+    let error = ""
+    native {Rust} [
+        let app_ptr = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let app_ptr_invoke = app_ptr.clone();
+        let app_ptr_setup = app_ptr.clone();
+        let app_ptr_exit = app_ptr.clone();
+
+        let built = tauri::Builder::default()
+            .invoke_handler(move |invoke| {
+                let command: String = invoke.message.command().to_string();
+                let payload: String = match invoke.message.payload() {
+                    tauri::ipc::InvokeBody::Json(v) => v.to_string(),
+                    tauri::ipc::InvokeBody::Raw(_) => String::new(),
+                };
+                let h: i64 = app_ptr_invoke.load(std::sync::atomic::Ordering::SeqCst);
+                invoke.resolver.respond_async(async move {
+                    let joined = tauri::async_runtime::spawn_blocking(move || {
+                        crate::tauri_handle(h, &command, &payload)
+                    })
+                    .await;
+                    let raw: String = match joined {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Err(tauri::ipc::InvokeError::from(e.to_string()));
+                        }
+                    };
+                    if let Some(msg) = raw.strip_prefix("!err:") {
+                        return Err(tauri::ipc::InvokeError::from(msg.to_string()));
+                    }
+                    if raw.is_empty() {
+                        return Ok::<serde_json::Value, tauri::ipc::InvokeError>(serde_json::Value::Null);
+                    }
+                    match serde_json::from_str::<serde_json::Value>(&raw) {
+                        Ok(v) => Ok::<serde_json::Value, tauri::ipc::InvokeError>(v),
+                        Err(_) => Ok::<serde_json::Value, tauri::ipc::InvokeError>(serde_json::Value::String(raw)),
+                    }
+                });
+                true
+            })
+            .setup(move |app| {
+                let handle: tauri::AppHandle = app.handle().clone();
+                let p: i64 = Box::into_raw(Box::new(handle)) as i64;
+                app_ptr_setup.store(p, std::sync::atomic::Ordering::SeqCst);
+                let _ = crate::tauri_handle(p, &"tauri:setup".to_string(), &String::new());
+                Ok(())
+            })
+            .build(tauri::generate_context!());
+
+        match built {
+            Ok(app) => {
+                app.run(move |_handle, event| {
+                    if let tauri::RunEvent::Exit = event {
+                        let p: i64 = app_ptr_exit.load(std::sync::atomic::Ordering::SeqCst);
+                        let _ = crate::tauri_handle(p, &"tauri:exit".to_string(), &String::new());
+                    }
+                });
+            }
+            Err(e) => {
+                error = e.to_string();
+            }
+        }
+    ]
+    end error
+]
+
+!! ---------------------------------------------------------------
+!! Pomocnicy dla tauri_handle (JSON / bledy / zdarzenia)
+!! ---------------------------------------------------------------
+
+!!! Odpowiedz "sukces" - tekst JSON przekazywany do JS bez zmian.
+fun tauri_ok(json: Str) -> Str [
+    end json
+]
+
+!!! Odpowiedz "blad" - `invoke(...)` w JS zostanie odrzucone z tym tekstem.
+fun tauri_err(message: Str) -> Str [
+    end "!err:" + message
+]
+
+!!! Cudzyslowia + escapowanie: "tekst" -> "\"tekst\"" (poprawny literal JSON).
+fun tauri_json_quote(text: Str) -> Str [
+    let out = ""
+    native {Rust} [
+        out = serde_json::to_string(text.as_str()).unwrap_or_else(|_| "null".to_string());
+    ]
+    end out
+]
+
+!!! Pole `key` z payloadu (obiekt JSON): string bez cudzyslowow, inne
+!!! wartosci jako tekst JSON, brak pola/niepoprawny JSON -> "".
+fun tauri_arg(payload: Str, key: Str) -> Str [
+    let out = ""
+    native {Rust} [
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload.as_str()) {
+            if let Some(f) = v.get(key.as_str()) {
+                out = match f {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+            }
+        }
+    ]
+    end out
+]
+
+!!! Pole `key` jako liczba calkowita, `fallback` gdy brak/zly typ.
+fun tauri_arg_int(payload: Str, key: Str, fallback: Int) -> Int [
+    let out = 0
+    native {Rust} [
+        out = serde_json::from_str::<serde_json::Value>(payload.as_str())
+            .ok()
+            .and_then(|v| v.get(key.as_str()).and_then(|f| f.as_i64()))
+            .unwrap_or(fallback);
+    ]
+    end out
+]
+
+!!! Pole `key` jako bool, `fallback` gdy brak/zly typ.
+fun tauri_arg_bool(payload: Str, key: Str, fallback: Bool) -> Bool [
+    let out = false
+    native {Rust} [
+        out = serde_json::from_str::<serde_json::Value>(payload.as_str())
+            .ok()
+            .and_then(|v| v.get(key.as_str()).and_then(|f| f.as_bool()))
+            .unwrap_or(fallback);
+    ]
+    end out
+]
+
+!!! Czy `command` przyszlo ze zdarzenia (zarejestrowanego tauri_listen)?
+fun tauri_is_event(command: Str) -> Bool [
+    let out = false
+    native {Rust} [
+        out = command.starts_with("event:");
+    ]
+    end out
+]
+
+!!! Nazwa zdarzenia z komendy "event:nazwa" ("" gdy to zwykla komenda).
+fun tauri_event_name(command: Str) -> Str [
+    let out = ""
+    native {Rust} [
+        out = command.strip_prefix("event:").unwrap_or("").to_string();
+    ]
+    end out
+]
+
+!! ---------------------------------------------------------------
+!! Zdarzenia (Rust <-> JS)
+!! ---------------------------------------------------------------
+
+!!! Wysyla zdarzenie do wszystkich okien. `payload` to JSON (albo zwykly
+!!! tekst; pusty = null). Zwraca true przy powodzeniu.
+fun tauri_emit(app: Int, event: Str, payload: Str) -> Bool [
+    let ok = false
+    native {Rust} [
+        use tauri::Emitter;
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        let value: serde_json::Value = if payload.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(payload.as_str()).unwrap_or_else(|_| serde_json::Value::String(payload.to_string()))
+        };
+        ok = handle.emit(event.as_str(), value).is_ok();
+    ]
+    end ok
+]
+
+!!! Jak tauri_emit, ale tylko do okna o etykiecie `label`.
+fun tauri_emit_to(app: Int, label: Str, event: Str, payload: Str) -> Bool [
+    let ok = false
+    native {Rust} [
+        use tauri::Emitter;
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        let value: serde_json::Value = if payload.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(payload.as_str()).unwrap_or_else(|_| serde_json::Value::String(payload.to_string()))
+        };
+        ok = handle.emit_to(label.as_str(), event.as_str(), value).is_ok();
+    ]
+    end ok
+]
+
+!!! Nasluchuje zdarzen `event` wysylanych z JS (emit). Kazde trafia do
+!!! tauri_handle jako komenda "event:<event>", payload = JSON zdarzenia.
+!!! Zwraca id do tauri_unlisten.
+fun tauri_listen(app: Int, event: Str) -> Int [
+    let id = 0
+    native {Rust} [
+        use tauri::Listener;
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        let name: String = event.to_string();
+        let command: String = format!("event:{}", name);
+        let h: i64 = app;
+        let event_id = handle.listen(name, move |ev| {
+            let body: String = ev.payload().to_string();
+            let _ = crate::tauri_handle(h, &command, &body);
+        });
+        id = event_id as i64;
+    ]
+    end id
+]
+
+!!! Przestaje sluchac (id z tauri_listen).
+fun tauri_unlisten(app: Int, id: Int) [
+    native {Rust} [
+        use tauri::Listener;
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        handle.unlisten(id as u32);
+    ]
+]
+
+!! ---------------------------------------------------------------
+!! Okna
+!! ---------------------------------------------------------------
+
+!!! Operacja na oknie `label` (z tauri.conf.json albo tauri_window_create).
+!!! `action`: show hide close destroy minimize unminimize maximize
+!!! unmaximize center focus fullscreen (arg "true"/"false") always_on_top
+!!! resizable decorations (arg "true"/"false") set_title (arg = tytul)
+!!! set_size (arg "szer,wys", logiczne px) set_position (arg "x,y")
+!!! eval (arg = kod JS). Zwraca "" przy sukcesie albo opis bledu.
+fun tauri_window_action(app: Int, label: Str, action: Str, arg: Str) -> Str [
+    let err = ""
+    native {Rust} [
+        use tauri::Manager;
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        let flag: bool = arg.as_str() == "true";
+        let pair: Vec<f64> = arg
+            .split(',')
+            .filter_map(|s| s.trim().parse::<f64>().ok())
+            .collect();
+        match handle.get_webview_window(label.as_str()) {
+            None => {
+                err = format!("okno '{}' nie istnieje", label);
+            }
+            Some(w) => {
+                let r: tauri::Result<()> = match action.as_str() {
+                    "show" => w.show(),
+                    "hide" => w.hide(),
+                    "close" => w.close(),
+                    "destroy" => w.destroy(),
+                    "minimize" => w.minimize(),
+                    "unminimize" => w.unminimize(),
+                    "maximize" => w.maximize(),
+                    "unmaximize" => w.unmaximize(),
+                    "center" => w.center(),
+                    "focus" => w.set_focus(),
+                    "fullscreen" => w.set_fullscreen(flag),
+                    "always_on_top" => w.set_always_on_top(flag),
+                    "resizable" => w.set_resizable(flag),
+                    "decorations" => w.set_decorations(flag),
+                    "set_title" => w.set_title(arg.as_str()),
+                    "eval" => w.eval(arg.to_string()),
+                    "set_size" => {
+                        if pair.len() == 2 {
+                            w.set_size(tauri::Size::Logical(tauri::LogicalSize::new(pair.get(0).copied().unwrap_or(0.0), pair.get(1).copied().unwrap_or(0.0))))
+                        } else {
+                            err = "set_size wymaga arg w formie szer,wys".to_string();
+                            Ok(())
+                        }
+                    }
+                    "set_position" => {
+                        if pair.len() == 2 {
+                            w.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(pair.get(0).copied().unwrap_or(0.0), pair.get(1).copied().unwrap_or(0.0))))
+                        } else {
+                            err = "set_position wymaga arg w formie x,y".to_string();
+                            Ok(())
+                        }
+                    }
+                    other => {
+                        err = format!("nieznana akcja okna '{}'", other);
+                        Ok(())
+                    }
+                };
+                if let Err(e) = r {
+                    err = e.to_string();
+                }
+            }
+        }
+    ]
+    end err
+]
+
+!!! Tworzy nowe okno. `url`: sciezka wzgledem frontendDist ("index.html")
+!!! albo pelny adres http(s). Zwraca "" albo opis bledu.
+fun tauri_window_create(app: Int, label: Str, url: Str, title: Str, width: Int, height: Int) -> Str [
+    let err = ""
+    native {Rust} [
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        let target: Option<tauri::WebviewUrl> = if url.starts_with("http://") || url.starts_with("https://") {
+            match tauri::Url::parse(url.as_str()) {
+                Ok(u) => Some(tauri::WebviewUrl::External(u)),
+                Err(e) => {
+                    err = e.to_string();
+                    None
+                }
+            }
+        } else {
+            Some(tauri::WebviewUrl::App(std::path::PathBuf::from(url.as_str())))
+        };
+        if let Some(t) = target {
+            let built = tauri::WebviewWindowBuilder::new(handle, label.as_str(), t)
+                .title(title.as_str())
+                .inner_size(width as f64, height as f64)
+                .build();
+            if let Err(e) = built {
+                err = e.to_string();
+            }
+        }
+    ]
+    end err
+]
+
+!!! Tytul okna ("" gdy okna nie ma).
+fun tauri_window_title(app: Int, label: Str) -> Str [
+    let out = ""
+    native {Rust} [
+        use tauri::Manager;
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        if let Some(w) = handle.get_webview_window(label.as_str()) {
+            out = w.title().unwrap_or_default();
+        }
+    ]
+    end out
+]
+
+!!! Czy okno istnieje i jest widoczne.
+fun tauri_window_is_visible(app: Int, label: Str) -> Bool [
+    let out = false
+    native {Rust} [
+        use tauri::Manager;
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        if let Some(w) = handle.get_webview_window(label.as_str()) {
+            out = w.is_visible().unwrap_or(false);
+        }
+    ]
+    end out
+]
+
+fun tauri_window_show(app: Int, label: Str) -> Bool [
+    end tauri_window_action(app, label.clone(), "show", "") == ""
+]
+
+fun tauri_window_hide(app: Int, label: Str) -> Bool [
+    end tauri_window_action(app, label.clone(), "hide", "") == ""
+]
+
+fun tauri_window_close(app: Int, label: Str) -> Bool [
+    end tauri_window_action(app, label.clone(), "close", "") == ""
+]
+
+fun tauri_window_minimize(app: Int, label: Str) -> Bool [
+    end tauri_window_action(app, label.clone(), "minimize", "") == ""
+]
+
+fun tauri_window_maximize(app: Int, label: Str) -> Bool [
+    end tauri_window_action(app, label.clone(), "maximize", "") == ""
+]
+
+fun tauri_window_center(app: Int, label: Str) -> Bool [
+    end tauri_window_action(app, label.clone(), "center", "") == ""
+]
+
+fun tauri_window_set_title(app: Int, label: Str, title: Str) -> Bool [
+    end tauri_window_action(app, label.clone(), "set_title", title.clone()) == ""
+]
+
+fun tauri_window_eval(app: Int, label: Str, js: Str) -> Bool [
+    end tauri_window_action(app, label.clone(), "eval", js.clone()) == ""
+]
+
+!! ---------------------------------------------------------------
+!! Aplikacja
+!! ---------------------------------------------------------------
+
+!!! Nazwa aplikacji (package.productName z tauri.conf.json / Cargo).
+fun tauri_app_name(app: Int) -> Str [
+    let out = ""
+    native {Rust} [
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        out = handle.package_info().name.clone();
+    ]
+    end out
+]
+
+!!! Wersja aplikacji.
+fun tauri_app_version(app: Int) -> Str [
+    let out = ""
+    native {Rust} [
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        out = handle.package_info().version.to_string();
+    ]
+    end out
+]
+
+!!! Katalog systemowy: app_data app_config app_cache app_log resource home
+!!! download desktop document temp. "" gdy nieznany lub niedostepny.
+fun tauri_path(app: Int, kind: Str) -> Str [
+    let out = ""
+    native {Rust} [
+        use tauri::Manager;
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        let resolver = handle.path();
+        let found = match kind.as_str() {
+            "app_data" => resolver.app_data_dir(),
+            "app_config" => resolver.app_config_dir(),
+            "app_cache" => resolver.app_cache_dir(),
+            "app_log" => resolver.app_log_dir(),
+            "resource" => resolver.resource_dir(),
+            "home" => resolver.home_dir(),
+            "download" => resolver.download_dir(),
+            "desktop" => resolver.desktop_dir(),
+            "document" => resolver.document_dir(),
+            "temp" => resolver.temp_dir(),
+            _ => Err(tauri::Error::UnknownPath),
+        };
+        if let Ok(p) = found {
+            out = p.to_string_lossy().to_string();
+        }
+    ]
+    end out
+]
+
+!!! Konczy aplikacje z kodem wyjscia.
+fun tauri_exit(app: Int, code: Int) [
+    native {Rust} [
+        let handle: &tauri::AppHandle = unsafe { &*(app as *const tauri::AppHandle) };
+        handle.exit(code as i32);
+    ]
+]
