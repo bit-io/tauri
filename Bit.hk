@@ -1,1 +1,21 @@
+[package]
+-> name        => tauri
+-> version     => 0.1.0
+-> description => Tauri 2 bindings for HackerScript (the shim itself is written in HackerScript)
+-> authors     => ["Bit Developers"]
+-> license     => MIT
+-> lang        => HackerScript
 
+[layout]
+-> lib => lib
+
+[lib]
+-> output => hlib
+
+[build]
+-> link => static
+
+[commands]
+-> hello
+--> run => cd examples/hello && virus build --release
+--> description => Build examples/hello (needs WebKitGTK on Linux, see README)
